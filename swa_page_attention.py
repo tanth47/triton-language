@@ -184,6 +184,222 @@ def run_vllm_unified(
 
 
 ####################### Paged Attention v1(Begin) ###############################
+@triton.jit
+def build_window_block_tables(
+    block_tables_ptr,          # *int32 [B, max_blocks]
+    kv_lens_ptr,               # *int32 [B]
+    new_block_tables_ptr,      # *int32 [B, win_blocks]
+    p1_kv_id_ptr,              # *int32 [B]
+    p2_kv_id_ptr,              # *int32 [B]
+    p1_size_ptr,               # *int32 [B]
+    p2_size_ptr,               # *int32 [B]
+    # need_move_ptr,             # *int8  [B]
+    B: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    WIN_BLOCKS: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    i = tl.program_id(0)
+    if i >= B:
+        return
+
+    # Load kv_len (supports either int32 or int64)
+    kv_len_i = tl.load(kv_lens_ptr + i)
+
+    # If kv_len < window_size -> nothing to do for this i
+    if kv_len_i <= WINDOW_SIZE:
+        # Zero metadata and early return; leave new_block_tables[i] untouched
+        tl.store(p1_kv_id_ptr + i, tl.full((), -1, tl.int32))
+        tl.store(p2_kv_id_ptr + i, tl.full((), -1, tl.int32))
+        tl.store(p1_size_ptr + i, tl.full((), 0, tl.int32))
+        tl.store(p2_size_ptr + i, tl.full((), 0, tl.int32))
+        # tl.store(need_move_ptr + i, tl.full((), 0, tl.int8))
+        return
+
+    # Compute sizes / block ids
+    p2_size = (kv_len_i % BLOCK_SIZE).to(tl.int32)
+    p1_size = (BLOCK_SIZE - p2_size).to(tl.int32)  # valid even when p2_size==0
+    p2_block_id = (kv_len_i - 1) // BLOCK_SIZE
+    p1_block_id = (kv_len_i - WINDOW_SIZE) // BLOCK_SIZE
+    need_move = p2_size != 0
+
+    # If we need to move the tail, figure out kv_ids for p1 and p2
+    p1_kv_id = tl.full((), -1, tl.int32)
+    p2_kv_id = tl.full((), -1, tl.int32)
+    if need_move:
+        p1_kv_id = tl.load(block_tables_ptr + i * MAX_BLOCKS + p1_block_id)
+        p2_kv_id = tl.load(block_tables_ptr + i * MAX_BLOCKS + p2_block_id)
+
+    # Where to start copying the window slice in the block table
+    start = (p1_block_id + (p2_size != 0)).to(tl.int32)
+
+    # Copy WIN_BLOCKS entries: new_block_tables[i, :] = block_tables[i, start : start+WIN_BLOCKS]
+    offs = tl.arange(0, WIN_BLOCKS)
+    src_idx = start + offs
+    mask = src_idx < MAX_BLOCKS  # safety in case of ragged table tails
+    src_ptrs = block_tables_ptr + i * MAX_BLOCKS + src_idx
+    dst_ptrs = new_block_tables_ptr + i * WIN_BLOCKS + offs
+    vals = tl.load(src_ptrs, mask=mask, other=tl.full((), 0, tl.int32))
+    tl.store(dst_ptrs, vals, mask=mask)
+
+    # Write metadata for kernel B
+    tl.store(p1_kv_id_ptr + i, p1_kv_id)
+    tl.store(p2_kv_id_ptr + i, p2_kv_id)
+    tl.store(p1_size_ptr + i, p1_size.to(tl.int32))
+    tl.store(p2_size_ptr + i, p2_size.to(tl.int32))
+    # tl.store(need_move_ptr + i, need_move.to(tl.int8))
+
+def _launch_move_kv_tail(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    p1_kv_id: torch.Tensor,   # int64 [B]
+    p2_kv_id: torch.Tensor,   # int64 [B]
+    p1_size: torch.Tensor,    # int32 [B]
+    p2_size: torch.Tensor,    # int32 [B]
+    # need_move: torch.Tensor,  # int8  [B]
+    H: int, D: int,
+    max_block_size: int,
+):
+    # Shapes / strides
+    # key_cache: [num_blocks, block_size, H, D]
+    assert key_cache.ndim == 4 and value_cache.ndim == 4
+    assert key_cache.shape == value_cache.shape
+    # s_k0, s_k1, s_k2, s_k3 = [torch.tensor(int(s), dtype=torch.int32, device=key_cache.device) for s in key_cache.stride()]
+    # s_v0, s_v1, s_v2, s_v3 = [torch.tensor(int(s), dtype=torch.int32, device=value_cache.device) for s in value_cache.stride()]
+    s_k0, s_k1, s_k2, s_k3 = key_cache.stride()
+    s_v0, s_v1, s_v2, s_v3 = value_cache.stride()
+
+    B = p1_kv_id.numel()
+
+    # We generate a tiny wrapper kernel that expands the t-loop up to max_block_size.
+    @triton.jit
+    def _copy_tail(
+        k_ptr, v_ptr,
+        s_k0, s_k1, s_k2, s_k3,
+        s_v0, s_v1, s_v2, s_v3,
+        p1_kv_id_ptr, p2_kv_id_ptr,
+        p1_size_ptr, p2_size_ptr, 
+        # need_move_ptr,
+        H, D, B,
+        MAX_T: tl.constexpr,
+        BLOCK_E: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_e = tl.program_id(1)
+        if pid_b >= B:
+            return
+        # need = tl.load(need_move_ptr + pid_b)
+        # if need == 0:
+        #     return
+        p2_sz = tl.load(p2_size_ptr + pid_b).to(tl.int32)
+
+        if p2_sz == 0:
+            return
+
+        p1_id = tl.load(p1_kv_id_ptr + pid_b).to(tl.int32)
+        p2_id = tl.load(p2_kv_id_ptr + pid_b).to(tl.int32)
+        p1_sz = tl.load(p1_size_ptr + pid_b).to(tl.int32)
+        # p2_sz = tl.load(p2_size_ptr + pid_b).to(tl.int32)
+
+        E = H * D
+        e_offsets = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)
+        e_mask = e_offsets < E
+        h_idx = e_offsets // D
+        d_idx = e_offsets % D
+
+        # Base pointers for K/V for this (p1_id/p2_id)
+        # Address: base + b0*s0 + t*s1 + h*s2 + d*s3
+        for t in tl.range(0, MAX_T):
+            # in_range = t < p1_sz
+            # if not tl.any(in_range & e_mask):
+            #     continue
+            t_src = (MAX_T - p1_sz + t)
+            t_dst = (p2_sz + t)
+
+            # Pointer math for K
+            k_src = (k_ptr + p1_id * s_k0 + t_src * s_k1 + h_idx * s_k2 + d_idx * s_k3)
+            k_dst = (k_ptr + p2_id * s_k0 + t_dst * s_k1 + h_idx * s_k2 + d_idx * s_k3)
+
+            # Pointer math for V
+            v_src = (v_ptr + p1_id * s_v0 + t_src * s_v1 + h_idx * s_v2 + d_idx * s_v3)
+            v_dst = (v_ptr + p2_id * s_v0 + t_dst * s_v1 + h_idx * s_v2 + d_idx * s_v3)
+
+            mask_t = e_mask & (t < p1_sz)  # guards both E tile and t
+            # Copy
+            k_val = tl.load(k_src, mask=mask_t, other=0.0)
+            v_val = tl.load(v_src, mask=mask_t, other=0.0)
+            tl.store(k_dst, k_val, mask=mask_t)
+            tl.store(v_dst, v_val, mask=mask_t)
+
+    # Tune tile across features
+    E = H * D
+    BLOCK_E = 256 if E >= 256 else 128 if E >= 128 else 64
+    grid = (B, (E + BLOCK_E - 1) // BLOCK_E)
+    _copy_tail[grid](
+        key_cache, value_cache,
+        s_k0, s_k1, s_k2, s_k3,
+        s_v0, s_v1, s_v2, s_v3,
+        p1_kv_id, p2_kv_id,
+        p1_size, p2_size, 
+        # need_move,
+        H, D, B,
+        MAX_T=max_block_size,   # equals BLOCK_SIZE
+        BLOCK_E=BLOCK_E,
+        num_warps=4,
+        num_stages=2,
+    )
+
+def slide_window_and_update_tables_triton(
+    key_cache: torch.Tensor,        # [num_blocks, block_size, H, D]
+    value_cache: torch.Tensor,      # [num_blocks, block_size, H, D]
+    block_tables: torch.Tensor,     # [B, max_num_blocks_per_req]
+    kv_lens: torch.Tensor,          # [B]
+    new_block_tables: torch.Tensor, # [B, window_size // block_size]
+    window_size: int,
+    block_size: int,
+):
+    assert window_size % block_size == 0
+    device = block_tables.device
+    assert device.type == "cuda", "Use CUDA/ROCm device"
+
+    B, MAX_BLOCKS = block_tables.shape
+    WIN_BLOCKS = window_size // block_size
+    _, bs, H, D = key_cache.shape
+    assert bs == block_size
+
+    # Aux metadata (no host loops)
+    p1_kv_id = torch.empty(B, dtype=torch.int32, device=device)
+    p2_kv_id = torch.empty(B, dtype=torch.int32, device=device)
+    p1_size  = torch.empty(B, dtype=torch.int32, device=device)
+    p2_size  = torch.empty(B, dtype=torch.int32, device=device)
+    # need_move = torch.empty(B, dtype=torch.int8, device=device)
+
+    # build new_block_tables and emit metadata
+    grid_a = (triton.cdiv(B, 1),)
+    build_window_block_tables[grid_a](
+        block_tables, kv_lens, new_block_tables,
+        p1_kv_id, p2_kv_id, p1_size, p2_size, 
+        # need_move,
+        B=B,
+        MAX_BLOCKS=MAX_BLOCKS,
+        WIN_BLOCKS=WIN_BLOCKS,
+        WINDOW_SIZE=window_size,
+        BLOCK_SIZE=block_size,
+        num_warps=2,
+        num_stages=2,
+    )
+
+    # move KV tails only where needed (p2_size > 0)
+    # (No allocation; in-place on key_cache/value_cache)
+    _launch_move_kv_tail(
+        key_cache, value_cache,
+        p1_kv_id, p2_kv_id, p1_size, p2_size, 
+        # need_move,        
+        H=H, D=D,
+        max_block_size=block_size,
+    )
+
 @perftest(num_iters=5, num_warmup=1)
 def run_pa_v1(
     query,
@@ -210,29 +426,12 @@ def run_pa_v1(
             device=block_tables.device,
         )
 
-        for i, kv_len in enumerate(kv_lens):
-            if kv_len < window_size:
-                continue
-            
-            p2_size = kv_len % block_size
-            p1_size = block_size - p2_size
-            p2_block_id = (kv_len - 1) // block_size 
-            p1_block_id = (kv_len - window_size) // block_size
-
-            if p2_size != 0:
-                p2_kv_id = block_tables[i, p2_block_id].item()
-                p1_kv_id = block_tables[i, p1_block_id].item()
-
-                # manipulate k,v to move p1_block_id to the end
-                key_cache[p2_kv_id, p2_size:].copy_(key_cache[p1_kv_id, (block_size - p1_size):])
-                value_cache[p2_kv_id, p2_size:].copy_(value_cache[p1_kv_id, (block_size - p1_size):])
-
-            # block_tables[i, start:start+win_blocks] with a LongTensor index 
-            # creates a new tensor via advanced indexing, not a view
-            # so it allocates a temporary before the copy_, 
-            # defeating “no-temp / cudagraph-friendly” goal.
-            src = block_tables[i].narrow(0, p1_block_id + (p2_size > 0), win_blocks)
-            new_block_tables[i].copy_(src)
+        slide_window_and_update_tables_triton(
+            key_cache, value_cache,
+            block_tables, kv_lens,
+            new_block_tables,
+            window_size, block_size,
+        )
 
         kv_lens = torch.clamp(kv_lens, max=window_size)
         block_tables = new_block_tables
