@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.runtime import driver
+from softmax import triton_softmax as naive_triton_softmax
 
 DEVICE = 'cuda:0'
 
@@ -62,13 +63,14 @@ def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n
         tl.store(output_ptrs, softmax_output, mask=mask)
 
 
-properties = torch.cuda.get_device_properties(0)
-NUM_SM = properties.multi_processor_count
-NUM_REGS = 40000 #properties["max_num_regs"] # ?
-SIZE_SMEM = 64000 #properties["max_shared_mem"]
-WARP_SIZE = 64  # properties["warpSize"]
+properties = driver.active.utils.get_device_properties(0)
+NUM_SM = properties["multiprocessor_count"]
+NUM_REGS = properties["max_num_regs"] # ? currently set to CDNA3 docs, max_wave_per_sm * nbr_regs_per_wave
+SIZE_SMEM = properties["max_shared_mem"]
+WARP_SIZE = properties["warpSize"]
 target = triton.runtime.driver.active.get_current_target()
 kernels = {}
+
 
 
 def softmax(x):
@@ -81,7 +83,9 @@ def softmax(x):
     # increasing the number of warps (`num_warps`) over which each row is distributed.
     # You will see in the next tutorial how to auto-tune this value in a more natural
     # way so you don't have to come up with manual heuristics yourself.
-    num_warps = 8
+    # if n_cols >= 128:
+    # num_warps = min(8, max(1, BLOCK_SIZE // WARP_SIZE))
+    num_warps = 4
 
     # Number of software pipelining stages.
     num_stages = 4 if SIZE_SMEM > 200000 else 2
@@ -95,6 +99,7 @@ def softmax(x):
     kernel._init_handles()
     n_regs = kernel.n_regs # number of registers used by a thread
     size_smem = max(kernel.metadata.shared, 1) # shared mem used by a block
+    # breakpoint()
     if is_hip():
         # NUM_REGS represents the number of regular purpose registers. On CDNA architectures this is half of all registers available.
         # However, this is not always the case. In most cases all registers can be used as regular purpose registers.
@@ -111,9 +116,12 @@ def softmax(x):
         # When we divide this number with WARP_SIZE we get maximum number of waves that can
         # execute on a CU (multi-processor)  in parallel.
         # MAX_NUM_THREADS = properties["max_threads_per_sm"]
-        MAX_NUM_THREADS = 32 * 64 # max_wave_per_sm * wavefront_size 
+        MAX_NUM_THREADS = 32 * WARP_SIZE # max_wave_per_sm * wavefront_size, 32 is max wave per CU, check rocminfo
         max_num_waves = MAX_NUM_THREADS // WARP_SIZE
-        occupancy = min(NUM_GPRS // (WARP_SIZE * n_regs), max_num_waves) // num_warps
+        occupancy = max_num_waves // num_warps
+
+        blocks_by_reg = NUM_GPRS // (n_regs * WARP_SIZE * num_warps)
+        occupancy = min(occupancy, blocks_by_reg)
     else:
         occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
     occupancy = min(occupancy, SIZE_SMEM // size_smem)
@@ -121,6 +129,7 @@ def softmax(x):
 
     num_programs = min(num_programs, n_rows)
 
+    assert num_programs > 0, "Could not launch any program; try reducing register or shared memory usage."
 
     # Create a number of persistent programs.
     kernel[(num_programs, 1, 1)](y, x, x.stride(0), y.stride(0), n_rows, n_cols,)
@@ -132,9 +141,9 @@ def softmax(x):
         x_names=['N'],  # argument names to use as an x-axis for the plot
         x_vals=[128 * i for i in range(2, 100)],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
-        line_vals=['triton', 'torch', 'naive_softmax'],  # possible values for `line_arg``
-        line_names=["Triton", "Torch", "Naive Softmax"],  # label name for the lines
-        styles=[('blue', '-'), ('green', '-'), ('red', '-')],  # line styles
+        line_vals=['triton', 'torch', 'naive_softmax', 'naive_triton_softmax'],  # possible values for `line_arg``
+        line_names=["Triton", "Torch", "Naive Softmax", "Naive Triton Softmax"],  # label name for the lines
+        styles=[('blue', '-'), ('green', '-'), ('red', '-'), ('purple', '-')],  # line styles
         ylabel="GB/s",  # label name for the y-axis
         plot_name="softmax-performance",  # name for the plot. Used also as a file name for saving the plot.
         args={'M': 4096},  # values for function arguments not in `x_names` and `y_name`
@@ -149,16 +158,19 @@ def benchmark(M, N, provider):
         ms = triton.testing.do_bench(lambda: softmax(x))
     if provider == 'naive_softmax':
         ms = triton.testing.do_bench(lambda: naive_softmax(x))
+    if provider == 'naive_triton_softmax':
+        ms = triton.testing.do_bench(lambda: naive_triton_softmax(x))
     gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms)
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    x = torch.randn(1823, 781, device=DEVICE)
+    N = 4224
+    x = torch.randn(4096, N, device=DEVICE)
     y_triton = softmax(x)
     y_torch = torch.softmax(x, axis=1)
-    assert torch.allclose(y_triton, y_torch), (y_triton, y_torch)
+    assert torch.allclose(y_triton, y_torch), f"Results do not match for N={N}"
 
-    benchmark.run(show_plots=True, print_data=True)
+    benchmark.run(show_plots=True, print_data=True, save_path="./softmax_perf")
 

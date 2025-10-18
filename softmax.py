@@ -91,14 +91,14 @@ def triton_softmax(x):
 
     return out
 
+if __name__ == "__main__":
+    sample = torch.tensor([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]], device='cuda')
+    ref_out = F.softmax(sample, dim=-1)
+    naive_out = naive_softmax(sample)
+    online_out = online_softmax(sample)
+    triton_out = triton_softmax(sample)
 
-sample = torch.tensor([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]], device='cuda')
-ref_out = F.softmax(sample, dim=-1)
-naive_out = naive_softmax(sample)
-online_out = online_softmax(sample)
-triton_out = triton_softmax(sample)
-
-print("Reference Output:\n", ref_out)
-print("Naive Softmax Output:\n", naive_out)
-print("Online Softmax Output:\n", online_out)
-print("Triton Softmax Output:\n", triton_out)
+    print("Reference Output:\n", ref_out)
+    print("Naive Softmax Output:\n", naive_out)
+    print("Online Softmax Output:\n", online_out)
+    print("Triton Softmax Output:\n", triton_out)
