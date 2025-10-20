@@ -83,6 +83,158 @@ def layer_norm_1_stage(x, normalized_shape, weight, bias, eps):
 
     return y
 
+############################### LayerNorm 3 Kernels ###############################
+
+@triton.jit
+def _layer_norm_stats_tiles(
+    X,
+    partial_sum,
+    partial_sum_sq,
+    stride,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    row_offset = row_id * stride
+    cols = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    x = tl.load(X + row_offset + cols, mask=cols < N, other=0.).to(tl.float32)
+    sum = tl.sum(x, axis=0)
+    sum_sq = tl.sum(x * x, axis=0)
+
+    idx = row_id * tl.num_programs(1) + tile_id
+    tl.store(partial_sum + idx, sum)
+    tl.store(partial_sum_sq + idx, sum_sq)
+
+@triton.jit
+def _layer_norm_stats_reduce(
+    partial_sum,
+    partial_sum_sq,
+    Mean,
+    Rstd,
+    N: tl.constexpr,
+    T: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    sum = 0.0
+    sum_sq = 0.0
+    for t in range(0, T, BLOCK_SIZE_T):
+        tile_id = t + tl.arange(0, BLOCK_SIZE_T)
+        mask = tile_id < T
+        idx = row_id * T + tile_id
+        p_sum = tl.load(partial_sum + idx, mask=mask, other=0.0)
+        p_sum_sq = tl.load(partial_sum_sq + idx, mask=mask, other=0.0)
+        sum += tl.sum(p_sum, axis=0)
+        sum_sq += tl.sum(p_sum_sq, axis=0)
+    mean = sum / N
+    var = (sum_sq - 2 * mean * sum + N * mean * mean) / N
+    rstd = 1 / tl.sqrt(var + eps)
+    tl.store(Mean + row_id, mean)
+    tl.store(Rstd + row_id, rstd)
+
+@triton.jit
+def _layer_norm_normalize_kernel(
+    X,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    stride,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    row_offset = row_id * stride
+    cols = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    mean = tl.load(Mean + row_id)
+    rstd = tl.load(Rstd + row_id)
+
+    w = tl.load(W + cols, mask=cols < N)
+    b = tl.load(B + cols, mask=cols < N)
+    x = tl.load(X + row_offset + cols, mask=cols < N, other=0.).to(tl.float32)
+
+    x_hat = (x - mean) * rstd
+    y = x_hat * w + b
+
+    tl.store(Y + row_offset + cols, y, mask=cols < N)
+
+
+def layer_norm_3stages(
+    X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, eps: float = 1e-5,
+):
+    """
+    X: [M, stride>=N], contiguous in the last dim (or provide proper stride)
+    W,B: [N], fp32 weights and biases recommended
+    Returns: (Y, Mean, Rstd)
+    """
+    assert X.dim() == 2
+    M, stride = X.shape
+    N = W.numel()
+    assert B.numel() == N
+    assert stride >= N
+
+    device = X.device
+    dtype  = X.dtype
+
+    BLOCK_SIZE = 1024
+
+    MAX_FUSED_SIZE = 65536 // X.element_size()
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
+    REDUCE_TILES_SIZE = BLOCK_SIZE // 2
+
+    TILE_SIZE = BLOCK_SIZE
+    T = (N + TILE_SIZE - 1) // TILE_SIZE
+
+    # heuristics for number of  warps
+    num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+
+    # buffers
+    partial_sum   = torch.empty((M * T,), device=device, dtype=torch.float32)
+    partial_sumsq = torch.empty_like(partial_sum)
+    Mean = torch.empty((M,), device=device, dtype=torch.float32)
+    Rstd = torch.empty_like(Mean)
+    Y    = torch.empty_like(X)  # compute in fp32; cast later if you want
+
+    # grid shapes
+    gridA = (M, T)                      # (row, tile)
+    gridB = (M,)                        # per-row reduction
+    gridC = (M, T)                      # (row, tile)
+
+    # KERNEL A
+    _layer_norm_stats_tiles[gridA](
+        X, partial_sum, partial_sumsq,
+        stride, N,
+        BLOCK_SIZE=TILE_SIZE,
+        num_warps=num_warps,  # good default for 256, tune on your GPU
+        num_stages=1,
+    )
+
+    # KERNEL B
+    _layer_norm_stats_reduce[gridB](
+        partial_sum, 
+        partial_sumsq,
+        Mean, Rstd,
+        N, T, eps,
+        BLOCK_SIZE_T=REDUCE_TILES_SIZE,   # reduce tiles per iteration
+        num_warps=4, num_stages=2,
+    )
+
+    # KERNEL C
+    _layer_norm_normalize_kernel[gridC](
+        X, Y, W, B, Mean, Rstd,
+        stride, N,
+        BLOCK_SIZE=TILE_SIZE,
+        num_warps=num_warps, num_stages=1,
+    )
+
+    return Y
+
 
 def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
     # create data
@@ -96,15 +248,20 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
     y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
     assert torch.allclose(y_tri_1_stage, y_ref, atol=1e-2, rtol=0)
 
+    y_tri_3_stage = layer_norm_3stages(x, weight, bias, eps)
+
+    assert torch.allclose(y_tri_3_stage, y_ref, atol=1e-2, rtol=0), f"{y_ref=}, {y_tri_3_stage=}"
+
+    print(f"LayerNorm forward ({M=}, {N=}) test passed!")
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
         x_vals=[512 * i for i in range(2, 64)],
         line_arg='provider',
-        line_vals=['triton-1stage', 'torch',],
-        line_names=['Triton-1Stage', 'Torch'],
-        styles=[('blue', '-'), ('green', '-')],
+        line_vals=['triton-1stage', 'torch', 'triton-3stages'],
+        line_names=['Triton-1Stage', 'Torch', 'Triton-3Stages'],
+        styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
         plot_name='layer-norm-fwd',
         args={'M': 4096, 'dtype': torch.float16,},
@@ -126,6 +283,9 @@ def bench_layer_norm(M, N, dtype, provider, eps=1e-5, device=DEVICE):
         if provider == "torch":
             return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
 
+        if provider == "triton-3stages":
+            return layer_norm_3stages(x, weight, bias, eps)
+        
     # forward pass
     gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
